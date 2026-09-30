@@ -7,6 +7,8 @@ const compression = require('compression');
 const Unblocker = require('unblocker');
 const http = require('http');
 const https = require('https');
+const dns = require('dns');
+const net = require('net');
 
 const app = express();
 const PORT = Number.parseInt(process.env.PORT, 10) || 3000;
@@ -34,13 +36,171 @@ const agentOptions = {
   maxSockets: MAX_SOCKETS,
   maxFreeSockets: MAX_FREE_SOCKETS,
   maxTotalSockets: MAX_TOTAL_SOCKETS,
-  scheduling: 'lifo'
+  scheduling: 'lifo',
+  lookup: safeLookup
 };
 const httpAgent = new http.Agent(agentOptions);
 const httpsAgent = new https.Agent(agentOptions);
 
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
+
+// ---------------------------------------------------------------------------
+// Security: block private/internal targets (SSRF) and rate-limit clients.
+// ---------------------------------------------------------------------------
+const ALLOW_PRIVATE_TARGETS = process.env.ALLOW_PRIVATE_TARGETS === '1';
+const RATE_LIMIT_WINDOW_MS = positiveInteger(process.env.RATE_LIMIT_WINDOW_SECONDS, 60) * 1000;
+const RATE_LIMIT_MAX = positiveInteger(process.env.RATE_LIMIT_MAX, 600);
+const rateBuckets = new Map();
+
+function isPrivateAddress(address) {
+  const family = net.isIP(address);
+  if (family === 4) {
+    const [a, b] = address.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      a >= 224;
+  }
+  if (family === 6) {
+    const lower = address.toLowerCase();
+    if (lower === '::' || lower === '::1') return true;
+    const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+    if (mapped) return isPrivateAddress(mapped[1]);
+    return /^f[cd]/.test(lower) || /^fe[89ab]/.test(lower);
+  }
+  return false;
+}
+
+// DNS-level guard: also protects against redirects and DNS rebinding because
+// it runs on every outgoing connection made through the shared agents.
+function safeLookup(hostname, options, callback) {
+  if (typeof options === 'function') { callback = options; options = {}; }
+  dns.lookup(hostname, options, (error, address, family) => {
+    if (error) return callback(error);
+    const list = Array.isArray(address) ? address.map((item) => item.address) : [address];
+    if (!ALLOW_PRIVATE_TARGETS && list.some(isPrivateAddress)) {
+      const blocked = new Error(`Blocked private address for ${hostname}`);
+      blocked.code = 'EBLOCKED';
+      return callback(blocked);
+    }
+    callback(null, address, family);
+  });
+}
+
+// URL-level guard: IP literals skip DNS lookup, so check them (and localhost) here.
+function blockPrivateProxyTargets(req, res, next) {
+  if (ALLOW_PRIVATE_TARGETS || !req.url.startsWith(PROXY_PREFIX)) return next();
+  let raw = req.url.slice(PROXY_PREFIX.length).replace(/^(https?):\/(?!\/)/i, '$1://');
+  if (!/^https?:\/\//i.test(raw)) raw = `http://${raw}`;
+  let target;
+  try { target = new URL(raw); } catch { return next(); }
+  const host = target.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.internal') ||
+      (net.isIP(host) && isPrivateAddress(host))) {
+    return res.status(403).send('Forbidden target');
+  }
+  next();
+}
+
+function rateLimitProxy(req, res, next) {
+  if (!req.url.startsWith(PROXY_PREFIX)) return next();
+  const now = Date.now();
+  const key = req.ip || 'unknown';
+  let bucket = rateBuckets.get(key);
+  if (!bucket || now - bucket.start > RATE_LIMIT_WINDOW_MS) {
+    bucket = { start: now, count: 0 };
+    rateBuckets.set(key, bucket);
+  }
+  bucket.count += 1;
+  if (bucket.count > RATE_LIMIT_MAX) {
+    res.set('Retry-After', String(Math.ceil((bucket.start + RATE_LIMIT_WINDOW_MS - now) / 1000)));
+    return res.status(429).send('Too many requests');
+  }
+  next();
+}
+setInterval(() => {
+  const cutoff = Date.now() - RATE_LIMIT_WINDOW_MS;
+  for (const [key, bucket] of rateBuckets) if (bucket.start < cutoff) rateBuckets.delete(key);
+}, 60_000).unref();
+
+// ---------------------------------------------------------------------------
+// Search-or-URL handling: URL-like input is opened as-is, anything else becomes
+// a search. Both end up on /proxy/<absolute-url>, so every link that follows is
+// proxied exactly like before.
+// ---------------------------------------------------------------------------
+const SEARCH_URL = process.env.SEARCH_URL || 'https://html.duckduckgo.com/html/?q=';
+
+function resolveUserInput(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return null;
+
+  if (/^https?:\/\//i.test(text)) {
+    try { return new URL(text).href; } catch { /* fall through to search */ }
+  } else if (!/\s/.test(text) && !/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) {
+    try {
+      const url = new URL(`https://${text}`);
+      const host = url.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+      const looksLikeHost = host === 'localhost' ||
+        (net.isIP(host) === 4 ? /^\d{1,3}(\.\d{1,3}){3}([:/?#]|$)/.test(text) : net.isIP(host) === 6) ||
+        /^([a-z0-9-]+\.)+([a-z]{2,}|xn--[a-z0-9-]+)$/.test(host);
+      if (looksLikeHost) return url.href;
+    } catch { /* fall through to search */ }
+  }
+  return `${SEARCH_URL}${encodeURIComponent(text)}`;
+}
+
+// /go?q=... : entry point for the top-page form.
+app.get('/go', (req, res) => {
+  const value = Array.isArray(req.query.q) ? req.query.q[0] : (req.query.q ?? req.query.url);
+  const target = resolveUserInput(value);
+  if (!target) return res.redirect(302, '/');
+  res.redirect(302, `${PROXY_PREFIX}${target}`);
+});
+
+// /proxy/<something that is not an absolute URL> : covers a form that simply
+// appends the typed text to /proxy/ (e.g. "wikipedia.org" or "猫 かわいい").
+app.use((req, res, next) => {
+  if (req.method !== 'GET' || !req.url.startsWith(PROXY_PREFIX)) return next();
+  const rest = req.url.slice(PROXY_PREFIX.length);
+  if (!rest || /^https?:\/{1,2}/i.test(rest) ||
+      rest.startsWith('client/') || rest.startsWith('unblocker-client.js')) return next();
+  let decoded = rest;
+  try { decoded = decodeURIComponent(rest); } catch { /* keep raw text */ }
+  const target = resolveUserInput(decoded);
+  if (!target) return next();
+  res.redirect(302, `${PROXY_PREFIX}${target}`);
+});
+
+// ---------------------------------------------------------------------------
+// Keep-alive: Render's free plan sleeps after ~15 minutes without inbound
+// traffic. Pinging our own public URL (RENDER_EXTERNAL_URL is set by Render)
+// goes through Render's router and counts as traffic.
+// ---------------------------------------------------------------------------
+const KEEP_ALIVE_URL = process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL || '';
+const KEEP_ALIVE_INTERVAL_MS = positiveInteger(process.env.KEEP_ALIVE_INTERVAL_SECONDS, 600) * 1000;
+
+function startKeepAlive() {
+  if (!KEEP_ALIVE_URL || process.env.KEEP_ALIVE === '0') return;
+  let target;
+  try { target = new URL('/healthz', KEEP_ALIVE_URL); } catch { return; }
+  const client = target.protocol === 'http:' ? http : https;
+  const ping = () => {
+    const request = client.get(target, { timeout: 15_000 }, (response) => {
+      response.resume();
+      console.log(JSON.stringify({ type: 'keep-alive', status: response.statusCode }));
+    });
+    request.once('timeout', () => request.destroy(new Error('timeout')));
+    request.once('error', (error) => {
+      console.warn(JSON.stringify({ type: 'keep-alive-error', message: error.message }));
+    });
+  };
+  setInterval(ping, KEEP_ALIVE_INTERVAL_MS).unref();
+  console.log(`Keep-alive enabled: ${target.href} every ${KEEP_ALIVE_INTERVAL_MS / 1000}s`);
+}
+
 
 app.use((req, res, next) => {
   const originalSetHeader = res.setHeader;
@@ -128,6 +288,26 @@ function sanitizeProxyResponseHeaders(data) {
   data.headers.location = sanitizeLocationValue(data.headers.location);
 }
 
+// Unblocker only rewrites absolute Location values and relies on the browser's
+// Referer to recover relative ones. Login pages often send no Referer
+// (Referrer-Policy), which drops the user out of the proxy after a redirect.
+// Resolve relative Locations here so they always stay under /proxy/.
+function keepRelativeRedirectInsideProxy(data) {
+  if (!data?.headers || data.headers.location == null || !data.url) return;
+  let source;
+  try { source = new URL(data.url); } catch { return; }
+  const host = source.hostname.toLowerCase();
+  if (host === 'poki.com' || host === 'www.poki.com') return; // clean-route handling owns these
+  const rewrite = (value) => {
+    if (typeof value !== 'string' || !value) return value;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(value) || value.startsWith('//') || value.startsWith(PROXY_PREFIX)) return value;
+    try { return `${PROXY_PREFIX}${new URL(value, source).href}`; } catch { return value; }
+  };
+  data.headers.location = Array.isArray(data.headers.location)
+    ? data.headers.location.map(rewrite)
+    : rewrite(data.headers.location);
+}
+
 // Normalize malformed proxied Location values such as /proxy/https:/host/path.
 function repairMalformedProxyLocation(data) {
   if (!data?.headers || data.headers.location == null) return;
@@ -190,7 +370,11 @@ function repairMinecraftDownloadLocation(location, baseUrl) {
     }
   }
 
-  return repairMinecraftDownloadUrl(absolute.href);
+  const repairedAbsolute = repairMinecraftDownloadUrl(absolute.href);
+  // Nothing to repair: keep the original (possibly relative) value so it is
+  // not turned into an absolute URL that bypasses the proxy.
+  if (repairedAbsolute === absolute.href) return location;
+  return `${PROXY_PREFIX}${repairedAbsolute}`;
 }
 
 function repairMinecraftDownloadUrl(value) {
@@ -592,6 +776,9 @@ app.use((req, res, next) => {
   next();
 });
 
+app.use(rateLimitProxy);
+app.use(blockPrivateProxyTargets);
+
 // Relay selected Bloxd backend APIs directly. On Cloud Shell, allowing
 // Unblocker to answer an OPTIONS request with a redirect makes the browser reject
 // the preflight. A direct relay keeps the request on this origin and returns CORS
@@ -935,6 +1122,66 @@ function requestMcpedlStatic(target, req, res, startedAt, attempt) {
   upstream.end();
 }
 
+// ---------------------------------------------------------------------------
+// Login/session fixes (unblocker 2.3.1 leaves these cases broken)
+//  1. Origin is not rewritten, so login POSTs reach the site with the proxy's
+//     origin and fail CSRF/origin checks (user is bounced back to the form).
+//  2. Cookies are re-scoped to /proxy/<origin>/ and lose "Secure". Browsers
+//     then reject __Host-/__Secure- cookies, SameSite=None and Partitioned.
+//  3. CORS responses name the real site, not the proxy, so API calls to other
+//     hosts (common for login) are blocked by the browser.
+// ---------------------------------------------------------------------------
+const COOKIE_PREFIX_ALIASES = [
+  [/^__host-/i, '__pxh_'],
+  [/^__secure-/i, '__pxs_']
+];
+
+function fixOriginHeader(data) {
+  const headers = data?.headers;
+  if (!headers || headers.origin == null || headers.origin === 'null') return;
+  let pageOrigin = null;
+  try {
+    const ref = new URL(headers.referer); // already unwrapped by unblocker's referer middleware
+    if (isHttpOrigin(ref)) pageOrigin = ref.origin;
+  } catch { /* no usable referer */ }
+  if (!pageOrigin) {
+    try { pageOrigin = new URL(data.url).origin; } catch { return; }
+  }
+  headers.origin = pageOrigin;
+}
+
+function restoreCookiePrefixes(data) {
+  const cookie = data?.headers?.cookie;
+  if (typeof cookie !== 'string' || !cookie.includes('__px')) return;
+  data.headers.cookie = cookie
+    .replace(/(^|;\s*)__pxh_/g, '$1__Host-')
+    .replace(/(^|;\s*)__pxs_/g, '$1__Secure-');
+}
+
+function repairSetCookieForProxy(data) {
+  const current = data?.headers?.['set-cookie'];
+  if (!current) return;
+  const list = Array.isArray(current) ? current : [current];
+  data.headers['set-cookie'] = list.map((cookie) => {
+    let text = String(cookie);
+    for (const [pattern, alias] of COOKIE_PREFIX_ALIASES) text = text.replace(pattern, alias);
+    return text
+      .replace(/;\s*SameSite=None/i, '; SameSite=Lax')
+      .replace(/;\s*Partitioned(?=\s*(;|$))/i, '');
+  });
+}
+
+function alignCorsResponse(data) {
+  const headers = data?.headers;
+  const origin = data?.clientRequest?.headers?.origin;
+  if (!headers || !origin || origin === 'null') return;
+  const allowed = headers['access-control-allow-origin'];
+  if (allowed == null) return;
+  if (allowed === '*' && String(headers['access-control-allow-credentials']) !== 'true') return;
+  headers['access-control-allow-origin'] = origin;
+  headers.vary = appendVary(headers.vary, 'Origin');
+}
+
 const unblocker = new Unblocker({
   prefix: PROXY_PREFIX,
   cookieRewrite: true,
@@ -942,7 +1189,7 @@ const unblocker = new Unblocker({
   clientScripts: true,
   httpAgent,
   httpsAgent,
-  requestMiddleware: [cleanProxyRequest, applyPokiRequestContext, applyYouTubeTvUserAgent],
+  requestMiddleware: [cleanProxyRequest, fixOriginHeader, restoreCookiePrefixes, applyPokiRequestContext, applyYouTubeTvUserAgent],
   responseMiddleware: [
     repairMalformedProxyLocation,
     keepPokiRedirectOnCleanRoute,
@@ -951,6 +1198,9 @@ const unblocker = new Unblocker({
     repairMinecraftDownloadRedirect,
     keepYouTubeTvRedirectInsideProxy,
     sanitizeProxyResponseHeaders,
+    keepRelativeRedirectInsideProxy,
+    repairSetCookieForProxy,
+    alignCorsResponse,
     rememberDocumentOrigin,
     preserveDownloadResponse,
     addConservativeAssetCache
@@ -1420,6 +1670,7 @@ app.use((req, res) => {
 
 const server = app.listen(PORT, () => {
   console.log(`Proxy listening on ${PORT}`);
+  startKeepAlive();
 });
 
 server.keepAliveTimeout = 30_000;
@@ -1512,6 +1763,7 @@ function isHttpOrigin(url) {
 function isLocalRoute(pathname) {
   return pathname === '/' ||
     pathname === '/healthz' ||
+    pathname === '/go' ||
     pathname === '/favicon.ico' ||
     pathname === '/robots.txt';
 }
